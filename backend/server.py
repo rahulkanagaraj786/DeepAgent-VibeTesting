@@ -57,6 +57,7 @@ app.add_middleware(
 )
 
 _runs: dict[str, dict] = {}
+_local_mcp_procs: list = []  # track locally started MCP server subprocesses
 
 
 class PipelineRequest(BaseModel):
@@ -72,59 +73,122 @@ def _sse_event(step_id: str, status: str, items: list[str],
     return f"data: {json.dumps(data)}\n\n"
 
 
-def deploy_mcp_server(server_path: str, server_name: str) -> Optional[str]:
-    """
-    Deploy a generated MCP server to TrueFoundry and return its public URL.
-    Returns None if deployment fails (non-fatal).
-    """
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _start_local_mcp_server(server_path: str, port: int) -> Optional[object]:
+    """Start a generated MCP server locally. Returns the subprocess or None."""
+    # Generated servers write to src/server.py (Blaxel layout)
+    server_file = Path(server_path) / "src" / "server.py"
+    if not server_file.exists():
+        server_file = Path(server_path) / "server.py"
+    if not server_file.exists():
+        print(f"[backend] server.py not found in {server_path}")
+        return None
+    # Prefer python3.11/3.13 where mcp[cli] is installed
+    py = sys.executable
+    for candidate in [sys.executable, "python3.11", "python3.13", "python3"]:
+        try:
+            result = subprocess.run(
+                [candidate, "-c", "from mcp.server.fastmcp import FastMCP"],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                py = candidate
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
     try:
-        from truefoundry.deploy import Service, Build, PythonBuild, Port, Resources
-
-        workspace_fqn = os.environ.get("TFY_WORKSPACE_FQN", "")
-        if not workspace_fqn:
-            print(f"[backend] TFY_WORKSPACE_FQN not set — skipping TrueFoundry deploy")
-            return None
-
-        safe_name = server_name.lower().replace("_", "-")[:50]
-
-        service = Service(
-            name=safe_name,
-            image=Build(
-                build_spec=PythonBuild(
-                    command="python server.py",
-                    requirements_path="requirements.txt",
-                    python_version="3.11",
-                )
-            ),
-            ports=[
-                Port(
-                    port=8000,
-                    protocol="TCP",
-                    expose=True,
-                    app_protocol="http",
-                )
-            ],
-            resources=Resources(
-                cpu_request=0.5,
-                cpu_limit=1,
-                memory_request=512,
-                memory_limit=1024,
-            ),
-            env={"PORT": "8000"},
-            replicas=1,
+        env = os.environ.copy()
+        env["PORT"] = str(port)
+        proc = subprocess.Popen(
+            [py, str(server_file)],
+            cwd=str(server_path),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-
-        deployment = service.deploy(workspace_fqn=workspace_fqn)
-        url = f"https://{safe_name}.{workspace_fqn}.truefoundry.com"
-        print(f"[backend] Deployed {safe_name} to TrueFoundry: {url}")
-        return url
-
-    except ImportError:
-        print(f"[backend] truefoundry not installed — skipping deploy")
+        # Wait up to 8 seconds for server to be ready
+        import socket
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    print(f"[backend] Local MCP server ready on port {port} (pid={proc.pid})")
+                    _local_mcp_procs.append(proc)
+                    return proc
+            except (OSError, ConnectionRefusedError):
+                if proc.poll() is not None:
+                    err = proc.stderr.read().decode()[:200] if proc.stderr else ""
+                    print(f"[backend] Local MCP server exited early: {err}")
+                    return None
+                time.sleep(0.3)
+        print(f"[backend] Local MCP server did not start in time on port {port}")
+        proc.terminate()
         return None
     except Exception as e:
-        print(f"[backend] TrueFoundry deploy failed (non-fatal): {e}")
+        print(f"[backend] Failed to start local MCP server: {e}")
         return None
+
+
+def deploy_mcp_server(server_path: str, server_name: str) -> Optional[str]:
+    """
+    Try TrueFoundry cloud deployment first; fall back to running the MCP server
+    locally so that end-to-end tool discovery and testing still works.
+    Returns the endpoint URL, or None if everything fails.
+    """
+    workspace_fqn = os.environ.get("TFY_WORKSPACE_FQN", "")
+    tfy_host = os.environ.get("TFY_HOST", "https://app.truefoundry.com")
+    safe_name = server_name.lower().replace("_", "-")[:50]
+
+    # ── Try TrueFoundry cloud deployment ────────────────────────────────
+    if workspace_fqn:
+        try:
+            from truefoundry.deploy import Service, Build, PythonBuild, Port, Resources
+            service = Service(
+                name=safe_name,
+                image=Build(
+                    build_spec=PythonBuild(
+                        command="python server.py",
+                        requirements_path="requirements.txt",
+                        python_version="3.11",
+                    )
+                ),
+                ports=[Port(port=8000, protocol="TCP", expose=True, app_protocol="http")],
+                resources=Resources(
+                    cpu_request=0.5, cpu_limit=1,
+                    memory_request=512, memory_limit=1024,
+                ),
+                env={"PORT": "8000"},
+                replicas=1,
+            )
+            service.deploy(workspace_fqn=workspace_fqn)
+            # Construct URL from cluster subdomain (workspace_fqn = cluster:namespace)
+            cluster = workspace_fqn.split(":")[0] if ":" in workspace_fqn else workspace_fqn
+            url = f"https://{safe_name}.{cluster}.{tfy_host.split('://')[-1]}/mcp"
+            print(f"[backend] Deployed {safe_name} to TrueFoundry: {url}")
+            return url
+        except ImportError:
+            print(f"[backend] truefoundry.deploy not available — falling back to local")
+        except Exception as e:
+            print(f"[backend] TrueFoundry deploy failed (non-fatal): {e} — falling back to local")
+
+    # ── Fall back: run MCP server locally ───────────────────────────────
+    port = _find_free_port()
+    proc = _start_local_mcp_server(server_path, port)
+    if proc:
+        local_url = f"http://localhost:{port}/mcp"
+        print(f"[backend] Local MCP server running at {local_url}")
+        return local_url
+
+    print(f"[backend] Could not start local MCP server for {server_name}")
+    return None
 
 
 def _build_test_detail(test_results) -> list[dict]:
@@ -403,16 +467,19 @@ def _run_pipeline_sync(urls: list[str]):
         if live_url:
             srv["deployed"] = True
             srv["endpoint_url"] = live_url
-            deploy_items.append(f"✓ {sname}: LIVE at {live_url}")
-            if tfy_workspace:
-                dashboard_url = f"{tfy_host}/workspaces/{tfy_workspace}/deployments"
-                deploy_items.append(f"  📊 TrueFoundry Dashboard: {dashboard_url}")
-                srv["dashboard_url"] = dashboard_url
+            if live_url.startswith("http://localhost"):
+                deploy_items.append(f"✓ {sname}: Running locally at {live_url}")
+                deploy_items.append(f"  (TrueFoundry cloud deploy skipped — no workspace configured)")
+            else:
+                deploy_items.append(f"✓ {sname}: LIVE at {live_url}")
+                if tfy_workspace:
+                    dashboard_url = f"{tfy_host}/workspaces/{tfy_workspace}/deployments"
+                    deploy_items.append(f"  TrueFoundry Dashboard: {dashboard_url}")
+                    srv["dashboard_url"] = dashboard_url
         else:
             srv["deployed"] = False
             srv["endpoint_url"] = None
-            deploy_items.append(f"⚠ {sname}: TrueFoundry deploy skipped (check TFY_WORKSPACE_FQN)")
-            deploy_items.append(f"  Server code available at: {srv['output_dir']}")
+            deploy_items.append(f"⚠ {sname}: deploy failed — server code at {srv['output_dir']}")
 
         yield _sse_event("deploy", "running", deploy_items)
 
@@ -567,6 +634,14 @@ def _run_pipeline_sync(urls: list[str]):
         f"Servers deployed: {len(deployed)}",
         "Pipeline complete ✓",
     ])
+
+    # Clean up any locally started MCP server processes
+    for proc in _local_mcp_procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _local_mcp_procs.clear()
 
 
 @app.post("/api/pipeline/start")
