@@ -1,2 +1,5 @@
 /output
 .env
+backend/extracted_specs/
+**/__pycache__/
+*.pyc

@@ -64,7 +64,7 @@ class PipelineRequest(BaseModel):
 
 
 def _sse_event(step_id: str, status: str, items: list[str],
-               extra: dict | None = None) -> str:
+               extra: Optional[dict] = None) -> str:
     """Format an SSE event."""
     data = {"step": step_id, "status": status, "items": items}
     if extra:
@@ -589,7 +589,7 @@ async def stream_pipeline(run_id: str):
     import queue
     import threading
 
-    event_queue: queue.Queue[str | None] = queue.Queue()
+    event_queue: queue.Queue = queue.Queue()
 
     def _worker():
         try:

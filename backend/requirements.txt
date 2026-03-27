@@ -1,5 +1,5 @@
 truefoundry>=0.10.0
-anthropic>=0.25.0
+google-genai>=0.8.0
 requests
 httpx
 pyyaml

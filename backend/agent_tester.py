@@ -19,12 +19,12 @@ logger = logging.getLogger(__name__)
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 FEATHERLESS_MODEL = "deepseek-ai/DeepSeek-V3-0324"
 
-# Anthropic client for reasoning loop
+# Gemini client for reasoning loop
 try:
-    import anthropic
-    _anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    from google import genai as _genai
+    _gemini_client = _genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 except Exception:
-    _anthropic_client = None
+    _gemini_client = None
 
 
 @dataclass
@@ -396,50 +396,166 @@ Return ONLY valid JSON."""
         test_result.analysis = "The MCP server infrastructure is deployed but upstream APIs are failing. Verify endpoint URLs and connectivity."
 
 
+def _finding_attr(finding, attr, default=None):
+    """Get attribute from a TestResult or plain dict finding."""
+    if isinstance(finding, dict):
+        return finding.get(attr, default)
+    return getattr(finding, attr, default)
+
+
+def _set_finding_attr(finding, attr, value):
+    """Set attribute on a TestResult or plain dict finding."""
+    if isinstance(finding, dict):
+        finding[attr] = value
+    else:
+        setattr(finding, attr, value)
+
+
+def _rule_based_root_cause(finding) -> dict:
+    """
+    Rule-based root cause analysis when Claude API is unavailable.
+    Infers root cause from test name, endpoint, method, and response text.
+    """
+    test_name = _finding_attr(finding, "test_name", "unknown_test")
+    endpoint = _finding_attr(finding, "endpoint", "/unknown")
+    method = _finding_attr(finding, "method", "GET")
+    actual = str(_finding_attr(finding, "actual_response", ""))
+    expected = str(_finding_attr(finding, "expected_response", ""))
+    status = _finding_attr(finding, "status", "error")
+
+    name_lower = test_name.lower()
+    actual_lower = actual.lower()
+    endpoint_lower = endpoint.lower()
+
+    # Derive severity
+    if any(w in name_lower for w in ["admin", "auth", "bypass", "injection", "privilege"]):
+        severity = "critical"
+    elif any(w in name_lower for w in ["payment", "checkout", "card", "expired", "security"]):
+        severity = "critical"
+    elif any(w in actual_lower for w in ["500", "server error", "internal"]):
+        severity = "warning"
+    else:
+        severity = "warning"
+
+    # Derive root cause
+    if "500" in actual or "internal server error" in actual_lower:
+        root_cause = (
+            f"Unhandled exception in {method} {endpoint}. "
+            f"The server is not handling error cases gracefully and returns a 500 instead of a proper error code."
+        )
+        fix_suggestion = (
+            f"Add try/except around the handler for {endpoint}. "
+            f"Return the appropriate HTTP error code (e.g. 402 for payment failures, 400 for bad input) "
+            f"with a structured error body: {{\"error\": \"<message>\"}}."
+        )
+        location = f"{endpoint.strip('/').replace('/', '_')}_handler"
+    elif "unauthorized" in name_lower or "without_auth" in name_lower or "bypass" in name_lower:
+        root_cause = (
+            f"Missing or bypassed authentication middleware on {method} {endpoint}. "
+            f"The endpoint returned {actual} when it should have returned 401 Unauthorized."
+        )
+        fix_suggestion = (
+            f"Add authentication middleware/guard to {endpoint}. "
+            f"Verify that the auth token is validated before the route handler executes. "
+            f"Return 401 with {{\"error\": \"Unauthorized\"}} for missing/invalid tokens."
+        )
+        location = f"middleware/auth.js or equivalent auth guard"
+    elif "expired" in name_lower or "card" in name_lower or "payment" in name_lower:
+        root_cause = (
+            f"Payment processing at {method} {endpoint} does not handle the expired card case. "
+            f"Got {actual} instead of a proper payment-declined response."
+        )
+        fix_suggestion = (
+            f"Catch payment gateway errors in the {endpoint} handler. "
+            f"Return HTTP 402 Payment Required with a body like "
+            f"{{\"error\": \"card_declined\", \"message\": \"Your card has expired.\"}}."
+        )
+        location = f"payment_service or {endpoint.strip('/').replace('/', '_')}_controller"
+    elif "404" in actual or "not found" in actual_lower:
+        root_cause = f"Resource not found at {method} {endpoint}. The route may not be registered or the resource does not exist."
+        fix_suggestion = f"Verify the route {endpoint} is registered and the resource exists. Check route ordering and prefix configuration."
+        location = f"routes/{endpoint.strip('/').split('/')[0]}.py"
+    else:
+        root_cause = (
+            f"Test '{test_name}' failed: expected '{expected}' but got '{actual}'. "
+            f"The endpoint {method} {endpoint} is not handling this case correctly."
+        )
+        fix_suggestion = (
+            f"Review the implementation of {method} {endpoint}. "
+            f"Ensure input validation, error handling, and response formatting are correct."
+        )
+        location = f"{endpoint.strip('/').replace('/', '_')}_handler"
+
+    return {
+        "root_cause": root_cause,
+        "root_cause_location": location,
+        "fix_suggestion": fix_suggestion,
+        "fix_explanation": f"This fix addresses the root cause by ensuring {endpoint} handles the '{test_name}' case properly.",
+        "severity": severity,
+    }
+
+
 def run_deep_reasoning_loop(
-    test_results: list[TestResult],
+    test_results,
     openapi_spec: dict,
+    repo_path=None,
     max_iterations: int = 3,
-) -> list[TestResult]:
+):
     """
     Re-reasoning loop: analyze initial results, perform root cause analysis
     and fix suggestion on each bug found.
-    """
-    if not _anthropic_client:
-        logger.warning("[reasoning_loop] Anthropic client not available, skipping deep reasoning")
-        return test_results
 
+    Accepts either list[TestResult] or list[dict] for test_results.
+    repo_path is accepted for compatibility but not used internally.
+    """
     all_findings = list(test_results)
 
-    for iteration in range(max_iterations):
-        anomalies = [f for f in all_findings if f.status in ["error", "unexpected", "failed"] or not f.passed]
+    # Determine which findings are anomalies
+    def _is_anomaly(f):
+        status = _finding_attr(f, "status", "")
+        passed = _finding_attr(f, "passed", True)
+        return status in ("error", "unexpected", "failed") or not passed
 
-        if not anomalies:
-            print(f"[reasoning_loop] Iteration {iteration+1}: No anomalies. Done.")
-            break
+    anomalies = [f for f in all_findings if _is_anomaly(f)]
+    if not anomalies:
+        print("[reasoning_loop] No anomalies found.")
+        return all_findings
 
-        print(f"[reasoning_loop] Iteration {iteration+1}: Found {len(anomalies)} anomalies. Re-reasoning...")
+    # Try Gemini API first
+    if _gemini_client:
+        for iteration in range(max_iterations):
+            anomalies_now = [f for f in all_findings if _is_anomaly(f) and not _finding_attr(f, "root_cause")]
 
-        anomaly_context = json.dumps([
-            {
-                "test_name": f.test_name,
-                "description": f.description,
-                "summary": f.summary,
-                "analysis": f.analysis,
-                "errors": [s.error for s in f.steps if s.error],
-            }
-            for f in anomalies[:5]
-        ], indent=2)
+            if not anomalies_now:
+                print(f"[reasoning_loop] Iteration {iteration+1}: All anomalies analyzed. Done.")
+                break
 
-        spec_context = json.dumps(openapi_spec.get("paths", {}), indent=2)[:3000]
+            print(f"[reasoning_loop] Iteration {iteration+1}: Found {len(anomalies_now)} anomalies. Re-reasoning with Gemini...")
 
-        try:
-            response = _anthropic_client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=2000,
-                messages=[{
-                    "role": "user",
-                    "content": f"""You are debugging a failing application. Here are anomalies found during testing:
+            def _to_dict(f):
+                if isinstance(f, dict):
+                    return {
+                        "test_name": f.get("test_name", ""),
+                        "endpoint": f.get("endpoint", ""),
+                        "method": f.get("method", ""),
+                        "actual_response": f.get("actual_response", ""),
+                        "expected_response": f.get("expected_response", ""),
+                        "status": f.get("status", ""),
+                        "input": f.get("input", {}),
+                    }
+                return {
+                    "test_name": f.test_name,
+                    "description": getattr(f, "description", ""),
+                    "summary": getattr(f, "summary", ""),
+                    "analysis": getattr(f, "analysis", ""),
+                    "errors": [s.error for s in getattr(f, "steps", []) if s.error],
+                }
+
+            anomaly_context = json.dumps([_to_dict(f) for f in anomalies_now[:5]], indent=2)
+            spec_context = json.dumps(openapi_spec.get("paths", {}), indent=2)[:3000]
+
+            try:
+                reasoning_prompt = f"""You are debugging a failing application. Here are anomalies found during testing:
 
 {anomaly_context}
 
@@ -463,28 +579,39 @@ Return JSON array:
   }}
 ]
 
-Return ONLY JSON.""",
-                }],
-            )
+Return ONLY JSON."""
+                response = _gemini_client.models.generate_content(model="models/gemini-2.5-flash-lite", contents=reasoning_prompt)
+                raw = response.text.strip().replace("```json", "").replace("```", "")
+                deep_analysis = json.loads(raw)
 
-            raw = response.content[0].text.strip().replace("```json", "").replace("```", "")
-            deep_analysis = json.loads(raw)
+                for analysis in deep_analysis:
+                    for finding in all_findings:
+                        if _finding_attr(finding, "test_name") == analysis.get("anomaly_id"):
+                            _set_finding_attr(finding, "root_cause", analysis.get("root_cause"))
+                            _set_finding_attr(finding, "root_cause_location", analysis.get("root_cause_location"))
+                            _set_finding_attr(finding, "fix_suggestion", analysis.get("fix_suggestion"))
+                            _set_finding_attr(finding, "fix_explanation", analysis.get("fix_explanation"))
+                            _set_finding_attr(finding, "severity", analysis.get("severity", "warning"))
 
-            for analysis in deep_analysis:
-                for finding in all_findings:
-                    if finding.test_name == analysis.get("anomaly_id"):
-                        finding.root_cause = analysis.get("root_cause")
-                        finding.root_cause_location = analysis.get("root_cause_location")
-                        finding.fix_suggestion = analysis.get("fix_suggestion")
-                        finding.fix_explanation = analysis.get("fix_explanation")
-                        finding.severity = analysis.get("severity", "warning")
+            except Exception as e:
+                print(f"[reasoning_loop] Gemini API error: {e}. Falling back to rule-based analysis.")
+                # Fall through to rule-based for any that weren't enriched
+                break
 
-        except Exception as e:
-            print(f"[reasoning_loop] Parse error: {e}")
+            new_critical = [f for f in all_findings if _finding_attr(f, "severity") == "critical" and _finding_attr(f, "root_cause")]
+            if not new_critical:
+                break
 
-        new_critical = [f for f in all_findings if f.severity == "critical" and f.root_cause]
-        if not new_critical:
-            break
+    # Rule-based fallback for any anomalies still missing root_cause
+    for finding in all_findings:
+        if _is_anomaly(finding) and not _finding_attr(finding, "root_cause"):
+            print(f"[reasoning_loop] Rule-based analysis for: {_finding_attr(finding, 'test_name')}")
+            analysis = _rule_based_root_cause(finding)
+            _set_finding_attr(finding, "root_cause", analysis["root_cause"])
+            _set_finding_attr(finding, "root_cause_location", analysis["root_cause_location"])
+            _set_finding_attr(finding, "fix_suggestion", analysis["fix_suggestion"])
+            _set_finding_attr(finding, "fix_explanation", analysis["fix_explanation"])
+            _set_finding_attr(finding, "severity", analysis["severity"])
 
     return all_findings
 

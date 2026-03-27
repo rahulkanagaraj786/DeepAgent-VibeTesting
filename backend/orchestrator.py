@@ -6,9 +6,9 @@ Analyzes the app and dispatches specialized sub-agents for different test strate
 import json
 import os
 
-import anthropic
+from google import genai
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+_gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are a senior QA architect and security engineer.
 Your job is to analyze an application's API spec and create a comprehensive,
@@ -81,14 +81,9 @@ Return a JSON object with this exact structure:
 Return ONLY the JSON, no markdown."""
 
     try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=3000,
-            system=ORCHESTRATOR_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        raw = response.content[0].text.strip()
+        full_prompt = f"{ORCHESTRATOR_SYSTEM_PROMPT}\n\n{prompt}"
+        response = _gemini_client.models.generate_content(model="models/gemini-2.5-flash-lite", contents=full_prompt)
+        raw = response.text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
 
         plan = json.loads(raw)

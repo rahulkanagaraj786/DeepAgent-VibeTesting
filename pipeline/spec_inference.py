@@ -9,9 +9,9 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import anthropic
+from google import genai
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+_gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 FRAMEWORK_PATTERNS = {
     "fastapi": {
@@ -283,13 +283,8 @@ Rules:
 
 The spec must have: openapi, info, paths, and components.schemas sections."""
 
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = response.content[0].text.strip()
+    response = _gemini_client.models.generate_content(model="models/gemini-2.5-flash-lite", contents=prompt)
+    raw = response.text.strip()
     raw = re.sub(r'^```(?:json)?\s*', '', raw)
     raw = re.sub(r'\s*```$', '', raw)
 
