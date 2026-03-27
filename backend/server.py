@@ -320,7 +320,7 @@ def _run_pipeline_sync(urls: list[str]):
         repo_name = ts["info"]["repo_name"]
         server_name = repo_name.lower().replace("_", "-")
         gen_items.append(f"Generating: {server_name} ({len(ts['tools'])} tools)...")
-        gen_items.append(f"  LLM: DeepSeek-V3 via Featherless")
+        gen_items.append(f"  LLM: Gemini (gemini-2.5-flash)")
         yield _sse_event("generate", "running", gen_items)
         try:
             output_dir = os.path.join(output_base, server_name)
