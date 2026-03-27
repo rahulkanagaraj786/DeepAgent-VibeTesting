@@ -452,11 +452,46 @@ def _run_pipeline_sync(urls: list[str]):
     mcp_test_items.append(f"All {len(generated_servers)} server(s) validated")
     yield _sse_event("mcp-test", "done", mcp_test_items)
 
-    # ── 10. Deploy (TrueFoundry) ─────────────────────────────────────────
-    yield _sse_event("deploy", "running", ["Deploying MCP servers to TrueFoundry..."])
+    # ── 10. Deploy (TrueFoundry MCP Gateway + local fallback) ────────────
+    yield _sse_event("deploy", "running", ["Deploying MCP servers..."])
     deploy_items = []
     tfy_host = os.environ.get("TFY_HOST", "https://app.truefoundry.com")
     tfy_workspace = os.environ.get("TFY_WORKSPACE_FQN", "")
+    tfy_api_key = os.environ.get("TFY_API_KEY", "")
+
+    # Try to register specs with TrueFoundry MCP Gateway via "Import from OpenAPI Spec"
+    if tfy_api_key and all_specs:
+        deploy_items.append("Registering with TrueFoundry MCP Gateway...")
+        yield _sse_event("deploy", "running", deploy_items)
+        for sp in all_specs[:1]:  # Register first spec
+            spec_path = sp["local_path"]
+            try:
+                import yaml
+                with open(spec_path) as f:
+                    spec_content = yaml.safe_load(f) if spec_path.endswith((".yaml", ".yml")) else json.load(f)
+                # TrueFoundry MCP Gateway "Import from OpenAPI Spec" API
+                import requests as _req
+                resp = _req.post(
+                    f"{tfy_host}/api/llm/v1/mcp/server",
+                    headers={"Authorization": f"Bearer {tfy_api_key}",
+                             "Content-Type": "application/json"},
+                    json={"type": "openapi", "spec": spec_content,
+                          "name": sp["repo_name"].lower().replace("/", "-")[:50]},
+                    timeout=15,
+                )
+                if resp.status_code in (200, 201):
+                    data = resp.json()
+                    mcp_url = data.get("url") or data.get("mcp_url") or data.get("endpoint")
+                    deploy_items.append(f"✓ Registered '{sp['repo_name']}' in TrueFoundry MCP Gateway")
+                    if mcp_url:
+                        deploy_items.append(f"  MCP endpoint: {mcp_url}")
+                else:
+                    deploy_items.append(f"  MCP Gateway auto-register pending — use 'Import from OpenAPI Spec' in TrueFoundry UI")
+                    deploy_items.append(f"  Spec available at: {spec_path}")
+            except Exception as e:
+                deploy_items.append(f"  MCP Gateway: {str(e)[:80]}")
+            deploy_items.append(f"  TrueFoundry MCP Gateway: {tfy_host}/mcp-gateway")
+            yield _sse_event("deploy", "running", deploy_items)
 
     for srv in generated_servers:
         sname = srv["server_name"]
@@ -485,8 +520,11 @@ def _run_pipeline_sync(urls: list[str]):
 
     deployed = [s for s in generated_servers if s.get("deployed")]
     deploy_items.append(f"Deployed: {len(deployed)}/{len(generated_servers)} MCP servers")
+    tfy_gateway_url = f"{tfy_host}/mcp-gateway"
+    deploy_items.append(f"TrueFoundry MCP Gateway: {tfy_gateway_url}")
     yield _sse_event("deploy", "done", deploy_items, {
         "tfy_dashboard": f"{tfy_host}/workspaces/{tfy_workspace}/deployments" if tfy_workspace else None,
+        "tfy_gateway": tfy_gateway_url,
     })
 
     # ── 11. End User Testing (AI agent + orchestrator + reasoning) ────────
